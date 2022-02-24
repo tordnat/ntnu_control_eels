@@ -1,0 +1,8 @@
+<launch>  
+    <arg name="velocity" default="0.1"/>
+
+    <node name="preset_controller" pkg="ntnu_control" type="preset_controller.py" output="screen">
+        <param name="linear_vel" value="$(arg velocity)" />
+    </node>
+
+</launch>
