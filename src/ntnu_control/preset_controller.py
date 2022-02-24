@@ -3,11 +3,14 @@
 
 import re
 import sys
-from typing import Dict
+from typing import Dict, Tuple
 from dataclasses import dataclass
 import rospy
 from sensor_msgs.msg import JointState
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose, QuaternionStamped
 import numpy as np
+import tf
 
 
 """
@@ -43,7 +46,6 @@ def decode_ros_msg(msg: JointState) -> np.ndarray:
     return arr
     
 def encode_ros_msg(state: np.ndarray) -> JointState:
-    print('Array:', state, file=sys.stderr)
     msg = JointState()
     for joint_num in range(0, state.shape[0]):
         for joint_type_i, joint_type in enumerate(JOINT_TYPES):
@@ -52,7 +54,6 @@ def encode_ros_msg(state: np.ndarray) -> JointState:
             msg.position.append(pos)
             msg.velocity.append(vel)
             msg.effort.append(effort)
-    print('Message:', msg, file=sys.stderr)
     return msg
 
 
@@ -76,26 +77,81 @@ def move_roll_right(vel: float, first: int = 0, last: int = N_modules) -> np.nda
 
 def move_bend(angle: float, first: int = 0, last: int = N_modules) -> np.ndarray:
     a = move_stop()
-    a[first:last, I_BEND, I_POS] = -angle
+    a[first:last, I_BEND, I_POS] = -angle / (last - first)
     return a
 
 def move_twist(angle: float, first: int = 0, last: int = N_modules) -> np.ndarray:
     a = move_stop()
-    a[first:last, I_TWIST, I_POS] = angle
+    a[first:last, I_TWIST, I_POS] = angle / (last - first)
     return a
 
 def move_incline(angle: float, module: int) -> np.ndarray:
     a = move_stop()
-    a += move_bend(angle, module, module+1)
-    a += move_twist(np.pi / 2, module, module+1)
+    a += move_twist(np.pi / 2, module-1, module)
+    a += move_bend(-angle, module, module+1)
     return a
+
+def move_roll_proportional(vel: float) -> np.ndarray:
+    a = move_stop()
+    for module in range(N_modules):
+        a += move_roll_right(vel, module, module+1) * (module / N_modules)
+    return a
+
+def make_u_config() -> np.ndarray:
+    return move_bend(-np.pi / 2)
+
+def make_screw_vectors(current_state: np.ndarray, target_direction: Tuple[float, float, float]) -> np.ndarray:
+    """Make screw forces that brings us in a target direction"""
+    # global heading angle
+    target_global_angle = np.arctan2(target_direction[1], target_direction[0])
+    # global angle of each module
+    module_global_angles = current_state[:, I_BEND, I_POS]
+    # relative heading angle for each module
+    module_force_angles = module_global_angles - target_global_angle
+
+    """
+    Velocity is a weighted sum of the forward and right unit vectors:
+        v(q1, q2) = [0 1](q1 - q2) + [1 0](q1 + q2)
+            = [
+                q1 + q2
+                q1 - q2
+            ]
+    Velocity is also determined by the relative target heading phi:
+        [ cos(phi), sin(phi) ] = [ (q1+q2), (q1-q2) ]
+    Solving for q1 and q2:
+        q1 + q2 = cos(phi)
+        q1 - q2 = sin(phi)
+        2q1 = cos(phi) + sin(phi)
+        2q2 = cos(phi) - sin(phi)
+    """
+    
+    scale = 0
+    
+    res = move_stop()
+    res[:, I_SCREW_FRONT, I_VEL] = scale * (np.cos(module_force_angles) + np.sin(module_force_angles))
+    res[:, I_SCREW_REAR, I_VEL] = scale * (np.cos(module_force_angles) - np.sin(module_force_angles))
+    return res
+
+def make_roll_help(configuration_error: np.ndarray) -> np.ndarray:
+    relative_bends = configuration_error[:, I_BEND, I_POS]
+    absolute_bends = np.cumsum(relative_bends)
+    absolute_bends -= np.mean(absolute_bends)
+
+    print('Error', absolute_bends)
+
+    c = 0.5
+
+    roll_helps = move_stop()
+    roll_helps[:, I_SCREW_FRONT, I_VEL] = -c * absolute_bends
+    roll_helps[:, I_SCREW_REAR, I_VEL] = -c * absolute_bends
+    return roll_helps
 
 
 class Controller():
     _actual_state: np.ndarray
 
     def __init__(self):
-        self._actual_state = move_stop()
+        self._actual_state = None
         self.command_rate = rospy.Rate(20)
         self.screw_radius = rospy.get_param("screw_radius")
         self.screw_pitch = rospy.get_param("screw_pitch")
@@ -106,7 +162,10 @@ class Controller():
         self.screw_rate = self.linear_vel / self.screw_constant
 
         self.state_sub = rospy.Subscriber("joint_states", JointState, callback=self._on_recv_state)
+        # self.odom_sub = rospy.Subscriber("odometry", Odometry, callback=self._on_recv_odom)
 
+        self.listener = tf.TransformListener()
+        self.link_orientations = []
         
         self.cmd_pub = rospy.Publisher("desired_joint_states", JointState, queue_size=10)
         while (self.cmd_pub.get_num_connections() < 1 and not rospy.is_shutdown()):
@@ -114,6 +173,8 @@ class Controller():
             self.cmd_pub.publish(JointState())
             rospy.sleep(1)
     
+    def _on_recv_odom(self, msg):
+        pass
 
     def _on_recv_state(self, msg: JointState):
         """
@@ -128,13 +189,28 @@ class Controller():
     def run(self):
         self.command_path()
 
+    def gen_path(self):
+        # self.link_orientations = self.get_link_orientations()
+        configuration_target = make_u_config()
+        if self._actual_state is None:
+            return configuration_target
+        else:
+            translation_movement = make_screw_vectors(self._actual_state, (0, 0, 0))
+            configuration_error = self._actual_state - configuration_target
+            return translation_movement \
+                    + configuration_target \
+                    + make_roll_help(configuration_error) \
+                    
+
     def gen_forward_path(self):
         rospy.loginfo("Generating forward path")
         
         return encode_ros_msg(
             # + move_forward(10)
-            # + move_bend(np.pi / 2, 11, 12)
-            + move_incline(np.pi / 4, 11)
+            # + move_twist(np.pi / 2, 9, 10)
+            # + move_bend(-np.pi / 2)
+            # + move_roll_proportional(1)
+            move_incline(np.pi / 4, 8)
         )
 
 
@@ -185,33 +261,21 @@ class Controller():
     def command_path(self):
         # Send forward velocity for the first 5 seconds
         rospy.loginfo("Start forward motion")
-        duration = rospy.Duration(60)
-        msg = self.gen_forward_path()
-        start_time = rospy.Time.now()
+
         while not rospy.is_shutdown():
+            msg = encode_ros_msg(self.gen_path())
             msg.header.stamp = rospy.Time.now()
             self.cmd_pub.publish(msg)
             self.command_rate.sleep()
 
-            if rospy.Time.now() - start_time > duration:
-                break
-
-        # Send rotating in the next 15 seconds
-        rospy.loginfo("Start circular motion")
-        duration = rospy.Duration(15)
-        msg = self.gen_circular_path()
-        start_time = rospy.Time.now()
-        while not rospy.is_shutdown():
-            msg.header.stamp = rospy.Time.now()
-            self.cmd_pub.publish(msg)
-            self.command_rate.sleep()
-            if rospy.Time.now() - start_time > duration:
-                break
-        
-        rospy.loginfo("Stopping all commanded motion")
-        msg = self.gen_stop()
-        self.cmd_pub.publish(msg)
-    
+    def get_link_orientations(self):
+        link_orientations = []
+        for i in range(1, self.num_joints + 1, 1):
+            unit_quat = QuaternionStamped()
+            unit_quat.header.stamp = rospy.Time.now()
+            unit_quat.header.frame_id = f"link_body_front_{i:02d}"
+            link_orientations.append(self.listener.transformQuaternion("map", unit_quat))
+        return link_orientations
 
 
 def main():
