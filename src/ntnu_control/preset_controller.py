@@ -113,6 +113,19 @@ class Controller():
         msg = self.gen_stop()
         self.cmd_pub.publish(msg)
     
+    def test_path(self):
+        mgs = JointState()
+        duration = rospy.Duration(10)
+        msg = self.gen_circular_path()
+        start_time = rospy.Time.now()
+        while not rospy.is_shutdown():
+            msg.header.stamp = rospy.Time.now()
+            self.cmd_pub.publish(msg)
+            self.command_rate.sleep()
+
+            if rospy.Time.now() - start_time > duration:
+                break
+    
 
 
 def main():
