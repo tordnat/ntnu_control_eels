@@ -8,10 +8,10 @@ from dataclasses import dataclass
 import rospy
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Pose, QuaternionStamped
+from geometry_msgs.msg import Pose, QuaternionStamped, Vector3Stamped
 import numpy as np
 import tf
-
+import tf.transformations
 
 """
 N x M x K
@@ -97,17 +97,18 @@ def move_roll_proportional(vel: float) -> np.ndarray:
         a += move_roll_right(vel, module, module+1) * (module / N_modules)
     return a
 
-def make_u_config() -> np.ndarray:
-    return move_bend(-np.pi / 2)
+def make_line_config() -> np.ndarray:
+    return move_bend(0)
 
-def make_screw_vectors(current_state: np.ndarray, target_direction: Tuple[float, float, float]) -> np.ndarray:
+def make_u_config() -> np.ndarray:
+    return move_bend(np.pi / 2)
+
+def make_screw_vectors(current_global_angles: np.ndarray, target_direction: Tuple[float, float, float]) -> np.ndarray:
     """Make screw forces that brings us in a target direction"""
     # global heading angle
     target_global_angle = np.arctan2(target_direction[1], target_direction[0])
-    # global angle of each module
-    module_global_angles = current_state[:, I_BEND, I_POS]
     # relative heading angle for each module
-    module_force_angles = module_global_angles - target_global_angle
+    module_force_angles = current_global_angles - target_global_angle
 
     """
     Velocity is a weighted sum of the forward and right unit vectors:
@@ -125,7 +126,8 @@ def make_screw_vectors(current_state: np.ndarray, target_direction: Tuple[float,
         2q2 = cos(phi) - sin(phi)
     """
     
-    scale = 0
+    scale = 0.2
+    print(scale)
     
     res = move_stop()
     res[:, I_SCREW_FRONT, I_VEL] = scale * (np.cos(module_force_angles) + np.sin(module_force_angles))
@@ -137,22 +139,31 @@ def make_roll_help(configuration_error: np.ndarray) -> np.ndarray:
     absolute_bends = np.cumsum(relative_bends)
     absolute_bends -= np.mean(absolute_bends)
 
-    print('Error', absolute_bends)
-
-    c = 0.5
+    c = 0.2
 
     roll_helps = move_stop()
     roll_helps[:, I_SCREW_FRONT, I_VEL] = -c * absolute_bends
     roll_helps[:, I_SCREW_REAR, I_VEL] = -c * absolute_bends
     return roll_helps
 
+def orientation_to_global_angle(orientation):
+    _, _, yaw = tf.transformations.euler_from_quaternion([
+        orientation.quaternion.x,
+        orientation.quaternion.y,
+        orientation.quaternion.z,
+        orientation.quaternion.w
+    ])
+    return yaw
+
+def orientations_to_global_angles(orientations):
+    return list(map(orientation_to_global_angle, orientations))
 
 class Controller():
     _actual_state: np.ndarray
 
     def __init__(self):
         self._actual_state = None
-        self.command_rate = rospy.Rate(20)
+        self.command_rate = rospy.Rate(100)
         self.screw_radius = rospy.get_param("screw_radius")
         self.screw_pitch = rospy.get_param("screw_pitch")
         self.num_joints = rospy.get_param("num_modules")
@@ -166,6 +177,7 @@ class Controller():
 
         self.listener = tf.TransformListener()
         self.link_orientations = []
+        self.global_angles = []
         
         self.cmd_pub = rospy.Publisher("desired_joint_states", JointState, queue_size=10)
         while (self.cmd_pub.get_num_connections() < 1 and not rospy.is_shutdown()):
@@ -184,18 +196,23 @@ class Controller():
         - joint_twist_{num}
         """
         self._actual_state = decode_ros_msg(msg)
+        print(self._actual_state[:, I_SCREW_FRONT, I_VEL])
 
 
     def run(self):
         self.command_path()
 
     def gen_path(self):
-        # self.link_orientations = self.get_link_orientations()
+        self.link_orientations = self.get_link_orientations()
+        self.global_angles = orientations_to_global_angles(self.link_orientations)
         configuration_target = make_u_config()
         if self._actual_state is None:
             return configuration_target
         else:
-            translation_movement = make_screw_vectors(self._actual_state, (0, 0, 0))
+            now = rospy.get_time()
+            translation_vector = (-1, 0, 0) # (np.cos(0.1*now), np.sin(0.1*now), 0)
+            # translation_movement = make_screw_vectors(np.array(self.global_angles), (0, 1, 0))
+            translation_movement = make_screw_vectors(np.array(self.global_angles), translation_vector)
             configuration_error = self._actual_state - configuration_target
             return translation_movement \
                     + configuration_target \
@@ -270,11 +287,20 @@ class Controller():
 
     def get_link_orientations(self):
         link_orientations = []
+        global_angles = []
+
+        now = rospy.Time.now()
+
         for i in range(1, self.num_joints + 1, 1):
             unit_quat = QuaternionStamped()
-            unit_quat.header.stamp = rospy.Time.now()
+            unit_quat.header.stamp = now
             unit_quat.header.frame_id = f"link_body_front_{i:02d}"
-            link_orientations.append(self.listener.transformQuaternion("map", unit_quat))
+            self.listener.waitForTransform(
+                f"link_body_front_{i:02d}", "map",
+                unit_quat.header.stamp, rospy.Duration(1.0))
+            link_orientation = self.listener.transformQuaternion("map", unit_quat)
+            link_orientations.append(link_orientation)
+
         return link_orientations
 
 
