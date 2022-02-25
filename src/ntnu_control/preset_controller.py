@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """A simple controller"""
 
+import random
 import re
 import sys
 from typing import Dict, Tuple
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 import rospy
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Pose, QuaternionStamped, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, QuaternionStamped, Vector3Stamped
 import numpy as np
 import tf
 import tf.transformations
@@ -80,6 +81,11 @@ def move_bend(angle: float, first: int = 0, last: int = N_modules) -> np.ndarray
     a[first:last, I_BEND, I_POS] = -angle / (last - first)
     return a
 
+def move_bend_effort(value: float, first: int = 0, last: int = N_modules) -> np.ndarray:
+    a = move_stop()
+    a[first:last, I_BEND, I_EFFORT] = value
+    return a
+
 def move_twist(angle: float, first: int = 0, last: int = N_modules) -> np.ndarray:
     a = move_stop()
     a[first:last, I_TWIST, I_POS] = angle / (last - first)
@@ -101,7 +107,7 @@ def make_line_config() -> np.ndarray:
     return move_bend(0)
 
 def make_u_config() -> np.ndarray:
-    return move_bend(np.pi / 2)
+    return move_bend(np.pi, 2, 11)
 
 def make_screw_vectors(current_global_angles: np.ndarray, target_direction: Tuple[float, float, float]) -> np.ndarray:
     """Make screw forces that brings us in a target direction"""
@@ -126,8 +132,7 @@ def make_screw_vectors(current_global_angles: np.ndarray, target_direction: Tupl
         2q2 = cos(phi) - sin(phi)
     """
     
-    scale = 0.2
-    print(scale)
+    scale = 5
     
     res = move_stop()
     res[:, I_SCREW_FRONT, I_VEL] = scale * (np.cos(module_force_angles) + np.sin(module_force_angles))
@@ -139,7 +144,7 @@ def make_roll_help(configuration_error: np.ndarray) -> np.ndarray:
     absolute_bends = np.cumsum(relative_bends)
     absolute_bends -= np.mean(absolute_bends)
 
-    c = 0.2
+    c = 5
 
     roll_helps = move_stop()
     roll_helps[:, I_SCREW_FRONT, I_VEL] = -c * absolute_bends
@@ -196,7 +201,6 @@ class Controller():
         - joint_twist_{num}
         """
         self._actual_state = decode_ros_msg(msg)
-        print(self._actual_state[:, I_SCREW_FRONT, I_VEL])
 
 
     def run(self):
@@ -205,89 +209,73 @@ class Controller():
     def gen_path(self):
         self.link_orientations = self.get_link_orientations()
         self.global_angles = orientations_to_global_angles(self.link_orientations)
-        configuration_target = make_u_config()
+        pos = np.array([msg.x for msg in self.get_link_positions()])
+        print(pos)
+        configuration_target = (
+            + move_twist(np.pi / 2, 0, 1)
+        )
         if self._actual_state is None:
             return configuration_target
         else:
             now = rospy.get_time()
-            translation_vector = (-1, 0, 0) # (np.cos(0.1*now), np.sin(0.1*now), 0)
+            translation_vector = (0, -1, 0) # (np.cos(0.1*now), np.sin(0.1*now), 0)
             # translation_movement = make_screw_vectors(np.array(self.global_angles), (0, 1, 0))
             translation_movement = make_screw_vectors(np.array(self.global_angles), translation_vector)
             configuration_error = self._actual_state - configuration_target
-            return translation_movement \
-                    + configuration_target \
-                    + make_roll_help(configuration_error) \
-                    
+            bend_err = np.max(abs(configuration_error[:, I_TWIST, I_POS]))
+            print(f'bend err: {np.rad2deg(bend_err)} deg')
+            if bend_err < np.deg2rad(10):
+                configuration_target += (
+                    + move_bend(np.deg2rad(90))
+                    + move_bend_effort(1000)
+                ) #* ((pos > 7) & (pos < 12)).reshape((12, 1, 1))
+            return (
+                + translation_movement
+                + configuration_target
+                # + make_roll_help(configuration_error)
+            )
 
-    def gen_forward_path(self):
-        rospy.loginfo("Generating forward path")
-        
-        return encode_ros_msg(
-            # + move_forward(10)
-            # + move_twist(np.pi / 2, 9, 10)
-            # + move_bend(-np.pi / 2)
-            # + move_roll_proportional(1)
-            move_incline(np.pi / 4, 8)
+    def gen_u_path(self):
+        self.link_orientations = self.get_link_orientations()
+        self.global_angles = orientations_to_global_angles(self.link_orientations)
+        configuration_target = (
+            + make_u_config()
+            # + make_line_config()
         )
+        if self._actual_state is None:
+            return configuration_target
+        else:
+            translation_vector = (0, 1, 0)
+            translation_movement = make_screw_vectors(np.array(self.global_angles), translation_vector)
+            configuration_error = self._actual_state - configuration_target
+            bend_err = np.mean(abs(configuration_error[:, I_BEND, I_POS]))
+            print(f'bend err: {np.rad2deg(bend_err)} deg')
 
+            if random.choices([True, False], [np.deg2rad(20), bend_err])[0]:
+                return (
+                    + translation_movement
+                    + configuration_target
+                    + make_roll_help(configuration_error)
+                )
+            else:
+                return (
+                    + configuration_target
+                    + make_roll_help(configuration_error)
+                )
 
-    def gen_bends(self, pos: int):
-        rospy.loginfo("Generating rise")
-        msg = JointState()
-        for i in range(1, self.num_joints + 1, 1):
-            msg.name.append("joint_screw_front_{i:02d}")
-            msg.name.append("joint_screw_back_{i:02d}")
-            msg.name.append("joint_bend_{i:02d}")
-        return msg
-    
-    def gen_circular_path(self):
-        rospy.loginfo("Generating circular path")
-        msg = JointState()
-        for i in range(1, self.num_joints + 1, 1):
-            msg.name.append(f"joint_screw_front_{i:02d}")
-            msg.velocity.append(self.screw_rate)
-            msg.position.append(0.0)
-            msg.effort.append(0.0)
-
-            msg.name.append(f"joint_screw_rear_{i:02d}")
-            msg.velocity.append(-self.screw_rate)
-            msg.position.append(0.0)
-            msg.effort.append(0.0)
-
-            msg.name.append(f"joint_bend_{i:02d}")
-            msg.velocity.append(0.0)
-            msg.position.append(0.4)
-            msg.effort.append(0.0)        
-        return msg
-    
-    def gen_stop(self):
-        rospy.loginfo("Generating stop path")
-        msg = JointState()
-        for i in range(1, self.num_joints + 1, 1):
-            msg.name.append(f"joint_screw_front_{i:02d}")
-            msg.velocity.append(0.0)
-            msg.position.append(0.0)
-            msg.effort.append(0.0)
-
-            msg.name.append(f"joint_screw_rear_{i:02d}")
-            msg.velocity.append(-0.0)
-            msg.position.append(0.0)
-            msg.effort.append(0.0)     
-        return msg
-    
+                    
     def command_path(self):
         # Send forward velocity for the first 5 seconds
         rospy.loginfo("Start forward motion")
 
         while not rospy.is_shutdown():
-            msg = encode_ros_msg(self.gen_path())
+            msg = encode_ros_msg(self.gen_u_path())
             msg.header.stamp = rospy.Time.now()
             self.cmd_pub.publish(msg)
             self.command_rate.sleep()
 
     def get_link_orientations(self):
         link_orientations = []
-        global_angles = []
 
         now = rospy.Time.now()
 
@@ -302,6 +290,23 @@ class Controller():
             link_orientations.append(link_orientation)
 
         return link_orientations
+
+    def get_link_positions(self):
+        link_positions = []
+
+        now = rospy.Time.now()
+
+        for i in range(1, self.num_joints + 1, 1):
+            zero_vector = PoseStamped()
+            zero_vector.header.stamp = now
+            zero_vector.header.frame_id = f"link_body_front_{i:02d}"
+            self.listener.waitForTransform(
+                f"link_body_front_{i:02d}", "map",
+                zero_vector.header.stamp, rospy.Duration(1.0))
+            link_position = self.listener.transformPose("map", zero_vector)
+            link_positions.append(link_position.pose.position)
+
+        return link_positions
 
 
 def main():
